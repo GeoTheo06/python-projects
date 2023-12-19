@@ -221,4 +221,3 @@ while True:
 				# Delay for 0.1 milliseconds
 				time.sleep(0.1)
 				turtle.bgcolor(random_color())
-	
