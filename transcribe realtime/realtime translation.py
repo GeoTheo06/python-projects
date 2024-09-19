@@ -75,3 +75,6 @@ while True:
 		translated_text = translate_text(recognized_text, dest_language='en')
 		print(f"\nTranslated text {i}: {translated_text}\n")
 	i=i+1
+
+	if recognized_text
+	translated_text = translate_text 	
