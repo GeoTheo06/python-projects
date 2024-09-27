@@ -1,86 +1,54 @@
 import os
+import msal
 import requests
 from dotenv import load_dotenv
-import msal
 
+load_dotenv(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'creds.env'))
 
-def auth():
-	# Load environment variables from creds.env
-	load_dotenv(r'C:\GEO\projects\Python Projects\onedrive_upload\creds.env')
+CLIENT_ID = os.getenv('CLIENT_ID')
+# Replace with your Azure AD app registration information
+AUTHORITY_URL = f'https://login.microsoftonline.com/consumers'
+SCOPES = ['User.Read', 'Files.ReadWrite']
 
-	client_id = os.getenv('CLIENT_ID')
-	tenant_id = os.getenv('DIR_ID')
-	client_secret = os.getenv('SECRET_SECRET_ID')
-	scopes = ['Files.ReadWrite.All']
+# File to upload
+file_path = r'C:\GEO\projects\Python Projects\onedrive_upload\test.txt'
+file_name = os.path.basename(file_path)
 
-	# Confidential client application for server-side applications
-	app = ConfidentialClientApplication(
-		client_id,
-		authority=f'https://login.microsoftonline.com/{tenant_id}',
-		client_credential=client_secret
-	)
+# OneDrive upload URL
+UPLOAD_URL = f"https://graph.microsoft.com/v1.0/me/drive/root:/Documents/{file_name}:/content"
 
-	# Acquire token
-	result = app.acquire_token_for_client(scopes=scopes)
+# MSAL client app configuration for delegated flow
+def get_access_token():
+    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY_URL)
+    
+    # First, try to load an existing token from cache
+    accounts = app.get_accounts()
+    if accounts:
+        token_response = app.acquire_token_silent(SCOPES, account=accounts[0])
+    else:
+        # If no token exists, prompt user to log in interactively
+        token_response = app.acquire_token_interactive(SCOPES)
+    
+    if 'access_token' in token_response:
+        return token_response['access_token']
+    else:
+        raise Exception(f"Could not obtain access token: {token_response}")
 
-	if 'access_token' in result:
-		access_token = result['access_token']
-		print("Access token obtained!")
-		return access_token
-	else:
-		print(f"Error acquiring token: {result.get('error_description')}")
-		return None
+# Upload file to OneDrive
+def upload_file_to_onedrive():
+    access_token = get_access_token()
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/octet-stream'
+    }
 
+    with open(file_path, 'rb') as file_data:
+        response = requests.put(UPLOAD_URL, headers=headers, data=file_data)
 
+    if response.status_code == 201:
+        print(f"File '{file_name}' uploaded successfully to OneDrive.")
+    else:
+        print(f"Failed to upload file: {response.status_code} - {response.text}")
 
-def upload_to_onedrive(access_token, folder_path, file_path, one_drive_path):
-	# Create the upload URL (OneDrive path)
-	upload_url = f'https://graph.microsoft.com/v1.0/me/drive/root:/{one_drive_path}:/content'
-
-	headers = {
-		'Authorization': f'Bearer {access_token}',
-		'Content-Type': 'application/octet-stream'
-	}
-
-	# Read file contents and upload
-	with open(file_path, 'rb') as file:
-		file_content = file.read()
-
-	response = requests.put(upload_url, headers=headers, data=file_content)
-
-	if response.status_code == 201:
-		print(f"Successfully uploaded: {one_drive_path}")
-	else:
-		print(access_token)
-		print(f"Failed to upload {one_drive_path}. Error: {response.text}")
-
-
-def traverse_and_upload(access_token, local_folder, one_drive_folder):
-	for root, dirs, files in os.walk(local_folder):
-		for file_name in files:
-			# Local file path
-			file_path = os.path.join(root, file_name)
-			
-			# OneDrive path (mirrors local folder structure)
-			relative_path = os.path.relpath(file_path, local_folder)
-			one_drive_path = os.path.join(one_drive_folder, relative_path).replace("\\", "/")
-			
-			# Upload file
-			upload_to_onedrive(access_token, local_folder, file_path, one_drive_path)
-			print(f'Uploaded {file_name} to {one_drive_path}')
-
-
-
-
-def main():
-	access_token = auth()
-
-	# Define the local folder and target OneDrive folder
-	local_folder = "C:/GEO/Uni"
-	one_drive_folder = "OneDrive_Folder"
-
-	print(access_token)
-	# Traverse the directory structure and upload files
-	traverse_and_upload(access_token, local_folder, one_drive_folder)
-
-main()
+if __name__ == "__main__":
+    upload_file_to_onedrive()
