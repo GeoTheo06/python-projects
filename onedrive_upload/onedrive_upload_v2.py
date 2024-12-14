@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from msal import PublicClientApplication
+from threading import Lock
 
 # -----------------------------
 # Configuration & Constants
@@ -20,12 +21,17 @@ SCOPES = ['Files.ReadWrite.All']
 LOCAL_ROOT_FOLDER = 'C:\\GEO'  # Update this to your local folder path
 DATABASE_FILE = 'file_metadata.db'
 GEO_FOLDER = 'GEO'
+
 CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB chunks for large file uploads
 SMALL_FILE_SIZE = 4 * 1024 * 1024  # Use simple upload if file < 4 MB
 SKIP_METADATA_THRESHOLD = 1 * 1024 * 1024  # Skip metadata patch for files < 1 MB
 
-# Global variable to store the authentication result
+MAX_RETRIES = 3         # Maximum number of retry attempts
+INITIAL_BACKOFF = 2.0   # Initial backoff seconds (exponential growth)
+
+# Global variables
 result = None
+lock = Lock()
 
 # -----------------------------
 # MSAL Initialization
@@ -35,7 +41,7 @@ if not result:
     result = app.acquire_token_interactive(SCOPES)
     print("Access token acquired successfully.")
 
-# Test connection to OneDrive
+# Test OneDrive connection
 headers = {
     'Authorization': f'Bearer {result["access_token"]}',
     'Content-Type': 'application/json'
@@ -78,44 +84,80 @@ def get_access_token():
     return result['access_token']
 
 # -----------------------------
+# Generic Retry Wrapper
+# -----------------------------
+def make_request_with_retry(method, url, headers=None, data=None, json_data=None, stream=False):
+    """
+    A generic requests wrapper that retries transient errors with exponential backoff.
+    method: 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'...
+    """
+    attempt = 1
+    backoff = INITIAL_BACKOFF
+    while attempt <= MAX_RETRIES:
+        try:
+            if method == 'GET':
+                resp = requests.get(url, headers=headers, stream=stream)
+            elif method == 'POST':
+                resp = requests.post(url, headers=headers, data=data, json=json_data)
+            elif method == 'PUT':
+                resp = requests.put(url, headers=headers, data=data)
+            elif method == 'PATCH':
+                resp = requests.patch(url, headers=headers, json=json_data)
+            elif method == 'DELETE':
+                resp = requests.delete(url, headers=headers)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+
+            # Check if transient error or success
+            if resp.status_code < 500 and resp.status_code != 429:
+                # For 2xx or 4xx (non-transient) errors, break out
+                return resp
+            else:
+                print(f"Transient HTTP error {resp.status_code} on attempt {attempt}. Retrying...")
+        except requests.ConnectionError as e:
+            print(f"Connection error on attempt {attempt}: {e}")
+        except requests.Timeout as e:
+            print(f"Timeout on attempt {attempt}: {e}")
+
+        # Exponential backoff before next attempt
+        time.sleep(backoff)
+        backoff *= 2
+        attempt += 1
+
+    print(f"All {MAX_RETRIES} retry attempts failed for {url}.")
+    return None
+
+# -----------------------------
 # OneDrive Folder Caching
 # -----------------------------
 def build_onedrive_folder_cache(folder_paths):
     """
-    Creates all required OneDrive subfolders in a single pass, 
-    instead of calling create_onedrive_folder_structure() for each file.
+    Pre-creates folder structure on OneDrive in a single pass.
     """
     print("Building folder structure cache in OneDrive...")
-    # Sort folder paths by depth so that parents are created before children
     sorted_folders = sorted(folder_paths, key=lambda p: p.count('/'))
-    
     existing_folders = set()
-    access_token = get_access_token()
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
 
     for folder_path in sorted_folders:
         if not folder_path or folder_path in existing_folders:
             continue
-        # Check if folder exists
+        access_token = get_access_token()
+        headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
         url = f'https://graph.microsoft.com/v1.0/me/drive/root:/{folder_path}'
-        resp = requests.get(url, headers=headers)
+        resp = make_request_with_retry('GET', url, headers=headers)
+        if resp is None:
+            continue  # Gave up on retries
         if resp.status_code == 200:
             existing_folders.add(folder_path)
         else:
-            # Create the folder
-            parent = os.path.dirname(folder_path)
-            if parent == '':
-                parent = '/'
+            parent = os.path.dirname(folder_path) or '/'
             create_url = f'https://graph.microsoft.com/v1.0/me/drive/root:/{parent}:/children'
             data = {'name': os.path.basename(folder_path), 'folder': {}, '@microsoft.graph.conflictBehavior': 'replace'}
-            resp2 = requests.post(create_url, headers=headers, json=data)
-            if resp2.status_code < 400:
+            resp2 = make_request_with_retry('POST', create_url, headers=headers, json_data=data)
+            if resp2 and resp2.status_code < 400:
                 existing_folders.add(folder_path)
             else:
-                print(f"Failed to create folder '{folder_path}': {resp2.status_code}, {resp2.text}")
+                print(f"Failed to create folder '{folder_path}': {resp2.status_code if resp2 else 'No Response'}")
 
 def gather_all_subfolders(file_map):
     """
@@ -126,7 +168,8 @@ def gather_all_subfolders(file_map):
     for relative_path in file_map:
         onedrive_path = os.path.join(GEO_FOLDER, relative_path).replace('\\', '/')
         folder = os.path.dirname(onedrive_path).strip('/')
-        folder_set.add(folder)
+        if folder:
+            folder_set.add(folder)
     return folder_set
 
 # -----------------------------
@@ -152,13 +195,11 @@ def scan_local_folder(root_folder):
 
 def delete_onedrive_item(item_id):
     access_token = get_access_token()
-    delete_url = f'https://graph.microsoft.com/v1.0/me/drive/items/{item_id}'
-    headers = {
-        'Authorization': f'Bearer {access_token}'
-    }
-    response = requests.delete(delete_url, headers=headers)
-    if response.status_code >= 400:
-        print(f"Failed to delete item: {response.status_code}, {response.text}")
+    headers = {'Authorization': f'Bearer {access_token}'}
+    url = f'https://graph.microsoft.com/v1.0/me/drive/items/{item_id}'
+    resp = make_request_with_retry('DELETE', url, headers=headers)
+    if resp is None or resp.status_code >= 400:
+        print(f"Failed to delete item: {resp.status_code if resp else 'No Response'}")
     else:
         print(f"Deleted item with ID {item_id} from OneDrive.")
 
@@ -172,20 +213,14 @@ def create_upload_session(onedrive_path):
         'Content-Type': 'application/json'
     }
     endpoint = f"https://graph.microsoft.com/v1.0/me/drive/root:/{onedrive_path}:/createUploadSession"
-    data = {
-        "@microsoft.graph.conflictBehavior": "replace",
-        "fileSystemInfo": {}
-    }
-    response = requests.post(endpoint, headers=headers, json=data)
-    if response.status_code >= 400:
-        print(f"Failed to create upload session: {response.status_code}, {response.text}")
-        return None
-    return response.json()
+    data = {"@microsoft.graph.conflictBehavior": "replace", "fileSystemInfo": {}}
+    resp = make_request_with_retry('POST', endpoint, headers=headers, json_data=data)
+    if resp and resp.status_code < 400:
+        return resp.json()
+    print(f"Failed to create upload session for {onedrive_path}")
+    return None
 
 def update_onedrive_metadata(item_id, creation_time, modification_time):
-    """
-    Optionally update creation/modified timestamps.
-    """
     access_token = get_access_token()
     headers = {
         'Authorization': f'Bearer {access_token}',
@@ -196,10 +231,10 @@ def update_onedrive_metadata(item_id, creation_time, modification_time):
         "createdDateTime": datetime.fromtimestamp(creation_time, tz=timezone.utc).isoformat(),
         "lastModifiedDateTime": datetime.fromtimestamp(modification_time, tz=timezone.utc).isoformat()
     }
-    json_data = {"fileSystemInfo": file_system_info}
-    response = requests.patch(metadata_url, headers=headers, json=json_data)
-    if response.status_code >= 400:
-        print(f"Failed to update file metadata: {response.status_code}, {response.text}")
+    resp = make_request_with_retry('PATCH', metadata_url, headers=headers, json_data={"fileSystemInfo": file_system_info})
+    if resp is None or resp.status_code >= 400:
+        code = resp.status_code if resp else 'No Resp'
+        print(f"Failed to update file metadata: {code}, {resp.text if resp else ''}")
 
 def upload_file_in_chunks(local_file_path, onedrive_path, creation_time, modification_time):
     session_info = create_upload_session(onedrive_path)
@@ -211,9 +246,9 @@ def upload_file_in_chunks(local_file_path, onedrive_path, creation_time, modific
     chunk_count = math.ceil(file_size / CHUNK_SIZE)
     print(f"Uploading '{local_file_path}' in {chunk_count} chunk(s)...")
 
+    start = 0
+    chunk_index = 1
     with open(local_file_path, 'rb') as f:
-        start = 0
-        chunk_index = 1
         while start < file_size:
             end = min(start + CHUNK_SIZE - 1, file_size - 1)
             chunk_size = end - start + 1
@@ -225,19 +260,21 @@ def upload_file_in_chunks(local_file_path, onedrive_path, creation_time, modific
                 'Content-Length': str(chunk_size),
                 'Content-Range': f'bytes {start}-{end}/{file_size}'
             }
-            r = requests.put(upload_url, headers=headers, data=chunk_data)
-            if r.status_code in (200, 201):
-                file_info = r.json()
+            resp = make_request_with_retry('PUT', upload_url, headers=headers, data=chunk_data)
+            if resp is None:
+                return None
+
+            if resp.status_code in (200, 201):
+                file_info = resp.json()
                 print(f"File upload finished for '{local_file_path}'.")
-                # For large files, always do metadata
                 update_onedrive_metadata(file_info['id'], creation_time, modification_time)
                 return file_info
-            elif r.status_code == 308:
+            elif resp.status_code == 308:
                 print(f"Uploaded chunk {chunk_index}/{chunk_count} for '{local_file_path}'. Continuing...")
                 start = end + 1
                 chunk_index += 1
             else:
-                print(f"Error uploading chunk. Status: {r.status_code}, Response: {r.text}")
+                print(f"Error uploading chunk. Status: {resp.status_code}, Response: {resp.text}")
                 return None
     return None
 
@@ -246,9 +283,7 @@ def upload_file_in_chunks(local_file_path, onedrive_path, creation_time, modific
 # -----------------------------
 def simple_upload_file(local_file_path, onedrive_path, mtime):
     access_token = get_access_token()
-    headers = {
-        'Authorization': f'Bearer {access_token}'
-    }
+    headers = {'Authorization': f'Bearer {access_token}'}
     try:
         with open(local_file_path, 'rb') as f:
             file_content = f.read()
@@ -257,21 +292,19 @@ def simple_upload_file(local_file_path, onedrive_path, mtime):
         return None
 
     upload_url = f'https://graph.microsoft.com/v1.0/me/drive/root:/{onedrive_path}:/content'
-    response = requests.put(upload_url, headers=headers, data=file_content)
-    if response.status_code >= 400:
-        print(f"Failed to upload file: {local_file_path} => {response.status_code}, {response.text}")
+    resp = make_request_with_retry('PUT', upload_url, headers=headers, data=file_content)
+    if resp is None or resp.status_code >= 400:
+        code = resp.status_code if resp else 'No Resp'
+        print(f"Failed to upload file: {local_file_path} => {code}, {resp.text if resp else ''}")
         return None
 
-    file_info = response.json()
+    file_info = resp.json()
     item_id = file_info['id']
-    # Skip metadata patch for tiny files (under SKIP_METADATA_THRESHOLD)
+    # Skip metadata patch for tiny files
     if os.path.getsize(local_file_path) > SKIP_METADATA_THRESHOLD:
         update_onedrive_metadata(item_id, mtime, mtime)
     return file_info
 
-# -----------------------------
-# Decision Logic for File Upload
-# -----------------------------
 def upload_file_to_onedrive(local_file_path, onedrive_path, mtime):
     file_size = os.path.getsize(local_file_path)
     if file_size < SMALL_FILE_SIZE:
@@ -280,30 +313,26 @@ def upload_file_to_onedrive(local_file_path, onedrive_path, mtime):
         return upload_file_in_chunks(local_file_path, onedrive_path, mtime, mtime)
 
 # -----------------------------
-# Parallel Upload
+# Parallel Upload Worker
 # -----------------------------
+stored_files = {}  # We'll fill this in main()
+
 def upload_worker(relative_path, file_info):
-    """
-    Worker function for parallel uploads. 
-    This will be executed in multiple threads simultaneously.
-    """
     onedrive_path = os.path.join(GEO_FOLDER, relative_path).replace('\\', '/')
-    stored_info = stored_files.get(relative_path)
-    
-    # If the file existed previously and changed
+    with lock:
+        stored_info = stored_files.get(relative_path)
+
     if stored_info:
+        # Check if file changed
         if file_info['mtime'] != stored_info['mtime'] or file_info['size'] != stored_info['size']:
             file_resp = upload_file_to_onedrive(file_info['local_path'], onedrive_path, file_info['mtime'])
             if file_resp:
-                cursor.execute('''
-                    UPDATE files SET mtime = ?, size = ? WHERE relative_path = ?
-                ''', (file_info['mtime'], file_info['size'], relative_path))
-                conn.commit()
-                print(f"Updated file on OneDrive: {onedrive_path}")
-        else:
-            # No changes
-            pass
-        # Mark as handled
+                with lock:
+                    cursor.execute('''
+                        UPDATE files SET mtime = ?, size = ? WHERE relative_path = ?
+                    ''', (file_info['mtime'], file_info['size'], relative_path))
+                    conn.commit()
+                    print(f"Updated file on OneDrive: {onedrive_path}")
         with lock:
             if relative_path in stored_files:
                 del stored_files[relative_path]
@@ -311,22 +340,19 @@ def upload_worker(relative_path, file_info):
         # New file
         file_resp = upload_file_to_onedrive(file_info['local_path'], onedrive_path, file_info['mtime'])
         if file_resp:
-            cursor.execute('''
-                INSERT INTO files (relative_path, mtime, size, onedrive_id)
-                VALUES (?, ?, ?, ?)
-            ''', (relative_path, file_info['mtime'], file_info['size'], file_resp['id']))
-            conn.commit()
-            print(f"Uploaded new file to OneDrive: {onedrive_path}")
+            with lock:
+                cursor.execute('''
+                    INSERT INTO files (relative_path, mtime, size, onedrive_id)
+                    VALUES (?, ?, ?, ?)
+                ''', (relative_path, file_info['mtime'], file_info['size'], file_resp['id']))
+                conn.commit()
+                print(f"Uploaded new file to OneDrive: {onedrive_path}")
 
 # -----------------------------
 # Main Function
 # -----------------------------
-from threading import Lock
-lock = Lock()  # for thread-safe dictionary modifications
-
 def main():
     global result, stored_files
-    # Attempt silent token acquisition again if needed
     result = app.acquire_token_silent(SCOPES, account=None)
     if not result:
         result = app.acquire_token_interactive(SCOPES)
@@ -336,17 +362,16 @@ def main():
     current_files = scan_local_folder(LOCAL_ROOT_FOLDER)
 
     # 2. Load stored records
-    stored_files = {}
     cursor.execute('SELECT relative_path, mtime, size, onedrive_id FROM files')
     for row in cursor.fetchall():
         stored_files[row[0]] = {'mtime': row[1], 'size': row[2], 'onedrive_id': row[3]}
 
-    # 3. Pre-create folder structure in OneDrive
-    #    (This drastically reduces overhead for many small files)
+    # 3. Pre-create folder structure
     folder_paths = gather_all_subfolders(current_files)
     build_onedrive_folder_cache(folder_paths)
 
     # 4. Parallel upload files
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     file_info_list = [(rp, info) for rp, info in current_files.items()]
     max_workers = 5  # Adjust for your bandwidth/CPU
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -356,7 +381,7 @@ def main():
             if exc:
                 print(f"Error in parallel upload thread: {exc}")
 
-    # 5. Handle deleted files
+    # 5. Handle locally deleted files
     for relative_path, stored_info in stored_files.items():
         onedrive_id = stored_info['onedrive_id']
         delete_onedrive_item(onedrive_id)
