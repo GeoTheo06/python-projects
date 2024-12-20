@@ -18,7 +18,7 @@ MEXC_API_SECRET = os.getenv('MEXC_API_SECRET')
 # Initialize Telegram client
 client = TelegramClient('my_user_session', TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
-def place_market_order(symbol, quote_qty=100):
+def place_market_order(symbol, quote_qty=10):
     base_url = "https://api.mexc.com"
     endpoint = "/api/v3/order"
     
@@ -108,49 +108,73 @@ def monitor_and_sell(symbol, buy_price, quantity):
                 break
 
             # Sleep for a short interval to avoid hitting API rate limits
-            time.sleep(5)
+            time.sleep(0.02)
 
         except Exception as e:
             print(f"Error while monitoring price: {e}")
-            time.sleep(5)
+            time.sleep(1)
 
-@client.on(events.NewMessage(chats='t.me/cryptoclubpump'))
+def get_order_details(symbol, order_id):
+    base_url = "https://api.mexc.com"
+    endpoint = "/api/v3/order"
+    
+    params = {
+        "symbol": f"{symbol.upper()}USDT",
+        "orderId": order_id,
+        "timestamp": int(time.time() * 1000)
+    }
+    
+    query_string = "&".join([f"{key}={value}" for key, value in params.items()])
+    signature = hmac.new(
+        MEXC_API_SECRET.encode('utf-8'),
+        query_string.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    
+    headers = {"X-MEXC-APIKEY": MEXC_API_KEY}
+    params["signature"] = signature
+    
+    response = requests.get(base_url + endpoint, headers=headers, params=params)
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Error fetching order details: {response.text}")
+        return None
+        
+
+@client.on(events.NewMessage(chats='t.me/thisisacryptotest'))
 async def handler(event):
-    message_time = datetime.utcnow().replace(tzinfo=None)
-    target_time = message_time.replace(hour=17, minute=0, second=0, microsecond=0)
     
-    # Calculate wait time until 4:57 AM UTC
-    desired_time = target_time - timedelta(minutes=3)
-    now = datetime.utcnow()
-    wait_time = (desired_time - now).total_seconds()
-    if wait_time > 0:
-        print(f"Waiting for {wait_time} seconds until 4:57 AM UTC")
-        time.sleep(wait_time)
-    
-    # Fetch the next message after 5 AM
-    new_message = await event.get_message()
-    crypto_symbol = new_message.text.strip().upper()
+    # Fetch the message content directly
+    crypto_symbol = event.message.message.strip().upper()  # Get the message text
     print(f"Received crypto symbol to buy: {crypto_symbol}")
     
     # Place buy order
     order = place_market_order(crypto_symbol)
     if order:
-        # Extract the quantity bought
-        if 'fills' in order and len(order['fills']) > 0:
-            quantity = float(order['fills'][0].get('qty', 0))
+        order_id = order.get('orderId')
+        if order_id:
+            time.sleep(1)  # Give it a moment to ensure execution
+            details = get_order_details(crypto_symbol, order_id)
+            if details:
+                executed_qty = float(details.get('executedQty', 0))
+                cummulative_quote_qty = float(details.get('cummulativeQuoteQty', 0))
+                
+                if executed_qty > 0:
+                    buy_price = cummulative_quote_qty / executed_qty
+                    # Now start the monitoring thread with executed_qty and buy_price
+                    monitor_thread = threading.Thread(
+                        target=monitor_and_sell, 
+                        args=(crypto_symbol, buy_price, executed_qty)
+                    )
+                    monitor_thread.start()
+                else:
+                    print("No executed quantity found. Order may not have filled yet.")
+            else:
+                print("Failed to retrieve detailed order info.")
         else:
-            quantity = float(order.get('executedQty', 0))
-        # Fetch the buy price
-        if 'fills' in order and len(order['fills']) > 0:
-            buy_price = float(order['fills'][0].get('price', 0))
-        else:
-            buy_price = 0
-        if buy_price > 0 and quantity > 0:
-            # Start monitoring the price in a separate thread
-            monitor_thread = threading.Thread(target=monitor_and_sell, args=(crypto_symbol, buy_price, quantity))
-            monitor_thread.start()
-        else:
-            print("Failed to retrieve buy price or quantity.")
+            print("Order placed, but no order_id returned.")
     else:
         print("Buy order was not successful.")
 
