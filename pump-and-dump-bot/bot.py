@@ -21,8 +21,8 @@ MEXC_API_SECRET = os.getenv('MEXC_API_SECRET')
 client = TelegramClient('my_user_session', TELEGRAM_API_ID, TELEGRAM_API_HASH)
 WEBSOCKET_URL = "wss://wbs.mexc.com/ws"
 
-GAIN = 1
-QUANTITY = 5
+GAIN = 1.5
+QUANTITY = 100
 
 def place_market_order(symbol, quote_qty=QUANTITY):
     base_url = "https://api.mexc.com"
@@ -49,10 +49,10 @@ def place_market_order(symbol, quote_qty=QUANTITY):
     response = requests.post(base_url + endpoint, headers=headers, params=params)
     if response.status_code == 200:
         order = response.json()
-        print(f"\n\nBuy Order successful: {order}\n")
+        print(f"\nBuy Order successful: {order}\n")
         return order
     else:
-        print(f"\n\nFailed to place order: {response.text}\n\n")
+        print(f"\nFailed to place order: {response.text}")
         return None
 
 def place_sell_order(symbol, quantity):
@@ -130,7 +130,7 @@ def monitor_and_sell_ws(symbol, buy_price, quantity):
                 print(f"{symbol} @ {current_price}")
                 
                 if current_price >= target_price:
-                    print(f"\n!!!!!!!!!!\nTarget achieved for {symbol} at price {current_price}. Selling now.")
+                    print(f"\n!!!!!!!!!!\nTarget achieved for {symbol} @ {current_price}\n")
 
                     # Continuously try placing the sell order until it succeeds
                     while True:
@@ -176,7 +176,7 @@ def monitor_and_sell_ws(symbol, buy_price, quantity):
             ]
         }
         ws.send(json.dumps(subscription_message))
-        print(f"Subscribed to WebSocket trade stream for {symbol}\n\n")
+        print(f"Subscribed to WebSocket trade stream for {symbol}")
 
     ws = websocket.WebSocketApp(
         WEBSOCKET_URL,
@@ -188,7 +188,7 @@ def monitor_and_sell_ws(symbol, buy_price, quantity):
 
     ws.run_forever()
 
-@client.on(events.NewMessage(chats='t.me/thisisacryptotest'))
+@client.on(events.NewMessage(chats='t.me/cryptoclubpump'))
 async def handler(event):
     crypto_symbol = event.message.message.strip().upper()
     print(f"Received symbol to buy: {crypto_symbol}")
@@ -205,7 +205,7 @@ async def handler(event):
                 
                 if executed_qty > 0:
                     buy_price = cummulative_quote_qty / executed_qty
-                    print(f"Buy details: Quantity={executed_qty} @ {buy_price}. Target: {buy_price * GAIN}")
+                    print(f"Buy details: Quantity={executed_qty} @ {buy_price}. Target: {buy_price * GAIN}\n")
                     
                     monitor_thread = threading.Thread(
                         target=monitor_and_sell_ws, 
@@ -220,7 +220,7 @@ async def handler(event):
         else:
             print("Order placed, but no order_id returned.")
     else:
-        print("Buy order was not successful.")
+        print("Buy order was not successful.\n\n")
 
 def main():
     with client:
