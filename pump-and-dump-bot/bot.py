@@ -21,8 +21,8 @@ MEXC_API_SECRET = os.getenv('MEXC_API_SECRET')
 client = TelegramClient('my_user_session', TELEGRAM_API_ID, TELEGRAM_API_HASH)
 WEBSOCKET_URL = "wss://wbs.mexc.com/ws"
 
-GAIN = 1.5
-QUANTITY = 100
+GAIN = 1.1 # 10% gain (exit price calculated as Entry price * GAIN)
+QUANTITY = 40
 
 def place_market_order(symbol, quote_qty=QUANTITY):
     base_url = "https://api.mexc.com"
